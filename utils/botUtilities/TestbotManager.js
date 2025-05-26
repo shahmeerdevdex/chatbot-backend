@@ -40,6 +40,8 @@ const languageCodeMap = {
   Russian: "ru-RU",
 };
 
+const GREETING_CACHE_PREFIX = 'greeting_';
+
 const voiceMap = {
   "English-Female": "en-US-Neural2-C",
   "English-Male": "en-GB-News-K",
@@ -258,7 +260,6 @@ function initializeTestbotNamespace(namespace) {
           const chain = await createChain(SystemPrompt, User_prompt, formData);
           dictConnection[socket.id].chain = chain;
         } else if (data.additionalData.milvus_index) {
-          console.log("Milvus Index");
           vectorStore = await Milvus.fromExistingCollection(embeddings, {
             collectionName: `_${data.additionalData.milvus_index}`,
             url: ZILLIZ_CLOUD_URI,
@@ -297,7 +298,7 @@ function initializeTestbotNamespace(namespace) {
           dictConnection[socket.id]?.language,
           dictConnection[socket.id]?.formData
         )) {
-          timeFunction("Last chunk sended Time: ");
+         
           socket.emit("audio_chunk", audioChunk);
         }
 
@@ -322,70 +323,111 @@ function initializeTestbotNamespace(namespace) {
       let messageType = data?.type;
 
       if (messageType === "text") {
-        console.log(Date.now());
-        timeFunction("Message Receive Time: ");
         await handleCommunication(socket, data?.data);
       } else if (messageType === "audio") {
+        // Optimize voice processing
         if (voiceReceive) {
-          timeFunction("First voice chunk received: ");
           voiceReceive = false;
         }
+        
         try {
-          if (!recognizeStream) {
-            recognizeStream = speechClient
-              .streamingRecognize({
-                config: {
-                  encoding: "LINEAR16",
-                  sampleRateHertz: 16000,
-                  languageCode: dictConnection[socket.id].languageCode,
-                  enableWordTimeOffsets: true,
-                  enableAutomaticPunctuation: true,
-                  enableWordConfidence: true,
-                  enableSpeakerDiarization: true,
-                  model: "command_and_search",
-                  useEnhanced: true,
-                },
-                interimResults: true,
-              })
-              .on("error", (err) => {
-                stopRecognitionStream();
-              })
-              .on("data", (data2) => {
-                const result = data2.results[0];
-                const isFinal = result.isFinal;
-
-                const transcription = data2.results
-                  .map((result) => result.alternatives[0].transcript)
-                  .join("\n");
-
-                if (silenceTimeout) {
-                  clearTimeout(silenceTimeout);
-                }
-
-                if (isFinal) {
-                  finalText += transcription + " ";
-                  stopRecognitionStream();
-                }
-
-                if (finalText.trim() === "") return;
-                timeFunction("Voice Conversion Ended: ");
-                silenceTimeout = setTimeout(async () => {
-                  socket.emit("audio_converted", "Audio Converted");
-                  timeFunction("Voice Delay Ended: ");
-                  console.log(finalText, "User Text");
-                  if (!botProcessing) {
-                    botProcessing = true;
-                    await handleCommunication(socket, finalText);
-                    botProcessing = false;
-                  }
-                  finalText = "";
-                }, 500);
-              });
+          // Buffer audio data to reduce processing overhead
+          if (!socket.audioBufferQueue) {
+            socket.audioBufferQueue = [];
+            socket.audioBufferSize = 0;
+            socket.processingAudio = false;
           }
+          
+          // Add to buffer queue
           const audioBuffer = Buffer.from(data?.data);
-          recognizeStream.write(audioBuffer);
+          socket.audioBufferQueue.push(audioBuffer);
+          socket.audioBufferSize += audioBuffer.length;
+          
+          // Only process when we have enough audio data (16KB) or it's been too long since last process
+          const BUFFER_THRESHOLD = 16 * 1024; // 16KB
+          
+          if (socket.audioBufferSize >= BUFFER_THRESHOLD && !socket.processingAudio) {
+            socket.processingAudio = true;
+            
+            // Initialize recognition stream if needed
+            if (!recognizeStream) {
+              // Start timing for STT
+              socket.sttStartTime = Date.now();
+              recognizeStream = speechClient
+                .streamingRecognize({
+                  config: {
+                    encoding: "LINEAR16",
+                    sampleRateHertz: 16000,
+                    languageCode: dictConnection[socket.id].languageCode,
+                    enableWordTimeOffsets: false, // Disable features we don't need
+                    enableAutomaticPunctuation: true,
+                    enableWordConfidence: false, // Disable for performance
+                    enableSpeakerDiarization: false, // Disable for performance
+                    model: "command_and_search",
+                    useEnhanced: true,
+                  },
+                  interimResults: true,
+                })
+                .on("error", (err) => {
+                  console.error("Speech recognition error:", err);
+                  stopRecognitionStream();
+                })
+                .on("data", (data2) => {
+                  const result = data2.results[0];
+                  const isFinal = result.isFinal;
+
+                  const transcription = data2.results
+                    .map((result) => result.alternatives[0].transcript)
+                    .join("\n");
+
+                  if (silenceTimeout) {
+                    clearTimeout(silenceTimeout);
+                  }
+
+                  if (isFinal) {
+                    finalText += transcription + " ";
+                    // Log the final transcription
+                    console.log(`STT TEXT: '${finalText.trim()}'`);
+                    stopRecognitionStream();
+                  }
+
+                  if (finalText.trim() === "") return;
+                  
+                  
+                  // Use a longer timeout to batch more text before processing
+                  silenceTimeout = setTimeout(async () => {
+                    socket.emit("audio_converted", "Audio Converted");
+                    
+                    if (!botProcessing) {
+                      botProcessing = true;
+                      // End timing for STT
+                      const sttEndTime = Date.now();
+                      const sttTotalTime = sttEndTime - (socket.sttStartTime || sttEndTime);
+                      const sttTotalSeconds = (sttTotalTime / 1000).toFixed(2);
+                      console.log(`STT TIME: ${sttTotalSeconds} sec`);
+                      await handleCommunication(socket, finalText);
+                      botProcessing = false;
+                    }
+                    finalText = "";
+                  }, 750); // Increased from 500ms to 750ms to batch more text
+                });
+            }
+            
+            // Process all buffered audio data at once
+            while (socket.audioBufferQueue.length > 0) {
+              const chunk = socket.audioBufferQueue.shift();
+              if (recognizeStream) {
+                recognizeStream.write(chunk);
+              }
+            }
+            
+            // Reset buffer size
+            socket.audioBufferSize = 0;
+            socket.processingAudio = false;
+          }
         } catch (err) {
           console.error("Error processing audio data:", err);
+          socket.processingAudio = false;
         }
       }
     });
@@ -415,6 +457,23 @@ async function* getResponse(
   language,
   formData
 ) {
+  // Start timing for response generation
+  const responseStartTime = Date.now();
+  console.log(`RESPONSE GENERATION START: ${new Date().toISOString()}`);
+  
+  // Check if this is a greeting message and try to get from cache
+  if (query.type === 'text' && formData?.Greeting_message) {
+    const cacheKey = `${GREETING_CACHE_PREFIX}${userLanguage}-${userVoiceType}`;
+    const cachedGreeting = await tts.getFromCache(cacheKey);
+    
+    if (cachedGreeting) {
+      console.log(`Using cached greeting for ${cacheKey}`);
+      yield cachedGreeting;
+      return;
+    }
+  }
+  // Flag to track if this is the first chunk
+  let isFirstChunk = true;
   const responseGenerator = processChat(
     chain,
     query,
@@ -424,37 +483,112 @@ async function* getResponse(
     language,
     formData
   );
+  
+  // Optimize by collecting more text before processing
   let collectedStr = "";
+  let sentenceBuffer = "";
   const userLanguage = dictConnection[sid].language;
   const userVoiceType = dictConnection[sid].voice_type;
   const voiceKey = `${userLanguage}-${userVoiceType}`;
   const googleVoice = voiceMap[voiceKey];
   speech_model = dictConnection[sid].speech_model;
 
+  // Minimum characters before processing to reduce API calls
+  const MIN_CHARS_FOR_PROCESSING = 50;
+  
+  // Process text in larger chunks to reduce TTS API calls
   for await (const value of responseGenerator) {
-    if (value) {
-      collectedStr += value;
-    }
-
-    if (
-      value == "." ||
-      value == "!" ||
-      value == "?" ||
-      value == "," ||
-      value.includes("!") ||
-      value.includes("?")
-    ) {
-      timeFunction("Chat Bot Ending Time: ");
-      console.log("Bot Msg: ", collectedStr);
-      yield await tts.googleTextToWav(
-        googleVoice,
-        collectedStr.trim().replace(/\*\*/g, ""),
-        speech_model
-      );
-      dictConnection[sid].lastMessage += collectedStr + " ";
-      collectedStr = "";
+    if (!value) continue;
+    
+    collectedStr += value;
+    sentenceBuffer += value;
+    
+    // Check if we have a sentence terminator or enough text accumulated
+    const hasSentenceEnd = 
+      value === "." || 
+      value === "!" || 
+      value === "?" || 
+      value.includes("!") || 
+      value.includes("?");
+    
+    // Process when we have a sentence end AND enough text, or a very long buffer
+    if ((hasSentenceEnd && sentenceBuffer.length >= MIN_CHARS_FOR_PROCESSING) || 
+        sentenceBuffer.length > 150) {
+      
+      
+      // Clean up the text before sending to TTS
+      const cleanText = sentenceBuffer.trim().replace(/\*\*/g, "");
+      
+      // Only make TTS API call if we have meaningful text
+      if (cleanText.length > 5) {
+        // Start timing for audio chunk processing
+        const audioChunkStartTime = Date.now();
+        
+        const audioContent = await tts.googleTextToWav(
+          googleVoice,
+          cleanText,
+          speech_model
+        );
+        
+        // Cache greeting message if this is the first chunk
+        if (isFirstChunk && query.type === 'text' && formData?.Greeting_message) {
+          const cacheKey = `${GREETING_CACHE_PREFIX}${userLanguage}-${userVoiceType}`;
+          await tts.saveToCache(cacheKey, audioContent);
+          console.log(`Cached greeting for ${cacheKey}`);
+        }
+        
+        // End timing for audio chunk processing
+        const audioChunkEndTime = Date.now();
+        const audioChunkTime = audioChunkEndTime - audioChunkStartTime;
+        const audioChunkSeconds = (audioChunkTime / 1000).toFixed(2);
+        console.log(`AUDIO CHUNK TIME: ${audioChunkSeconds} sec (${cleanText.length} chars)`);
+        
+        // Log time for first chunk sent to frontend
+        if (isFirstChunk) {
+          const firstChunkTime = Date.now() - responseStartTime;
+          const firstChunkSeconds = (firstChunkTime / 1000).toFixed(2);
+          console.log(`FIRST CHUNK TIME TO FRONTEND: ${firstChunkSeconds} sec`);
+          isFirstChunk = false;
+        }
+        
+        yield audioContent;
+      }
+      
+      // Save to last message and reset sentence buffer
+      dictConnection[sid].lastMessage += sentenceBuffer;
+      sentenceBuffer = "";
     }
   }
+  
+  // Process any remaining text in the buffer
+  if (sentenceBuffer.length > 0) {
+    const cleanText = sentenceBuffer.trim().replace(/\*\*/g, "");
+    if (cleanText.length > 0) {
+      // Start timing for final audio chunk
+      const finalAudioStartTime = Date.now();
+      
+      const audioContent = await tts.googleTextToWav(
+        googleVoice,
+        cleanText,
+        speech_model
+      );
+      
+      // End timing for final audio chunk
+      const finalAudioEndTime = Date.now();
+      const finalAudioTime = finalAudioEndTime - finalAudioStartTime;
+      const finalAudioSeconds = (finalAudioTime / 1000).toFixed(2);
+      console.log(`FINAL AUDIO TIME: ${finalAudioSeconds} sec (${cleanText.length} chars)`);
+      
+      yield audioContent;
+      dictConnection[sid].lastMessage += sentenceBuffer;
+    }
+  }
+  
+  // End timing for response generation
+  const responseEndTime = Date.now();
+  const responseTime = responseEndTime - responseStartTime;
+  const responseSeconds = (responseTime / 1000).toFixed(2);
+  console.log(`TOTAL RESPONSE TIME: ${responseSeconds} sec`);
 }
 
 module.exports = { initializeTestbotNamespace };

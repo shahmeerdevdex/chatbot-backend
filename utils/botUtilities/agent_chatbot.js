@@ -24,6 +24,16 @@ async function timeFunction(text) {
   console.log(text + currentDate.toISOString());
 }
 
+// Cache for vector search results to avoid redundant searches
+const vectorSearchCache = new Map();
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes cache TTL
+const TOP_K = 2; // Reduced from default (usually 3-10) for speed
+
+// Helper to get cache key
+function getCacheKey(question, indexType) {
+  return `${indexType}:${question.trim().toLowerCase()}`;
+}
+
 async function* processChat(
   chain,
   question,
@@ -33,38 +43,99 @@ async function* processChat(
   language,
   formData
 ) {
-  timeFunction("Before Retriever: ");
+  // Start timing for the entire process
+  const totalStartTime = Date.now();
+  console.log(`PROCESS START: ${new Date().toISOString()}`);
+  
+  // Start timing for vector retrieval
+  const retrievalStartTime = Date.now();
   let docs;
-  if (indexType === "milvus") {
-    console.log("milvus retriever working");
-    const retriever = vectorStore.asRetriever({
-      searchType: "similarity",
-      k: 3,
-    });
-    let newdocs = await retriever.getRelevantDocuments(question);
-    docs = newdocs.map((doc) => ({
-      ...doc,
-      pageContent: doc.metadata?.text || doc.pageContent,
-    }));
+  
+  // Start vector search timing
+  const vectorSearchStartTime = Date.now();
+  
+  // Check if we have a cached result for this question
+  const cacheKey = getCacheKey(question, indexType);
+  const cachedResult = vectorSearchCache.get(cacheKey);
+  
+  if (cachedResult && (Date.now() - cachedResult.timestamp < CACHE_TTL)) {
+    docs = cachedResult.docs;
+    console.log('Using cached vector search result');
+    const vectorSearchTime = Date.now() - vectorSearchStartTime;
+    console.log(`VECTOR CACHE HIT TIME: ${(vectorSearchTime/1000).toFixed(2)} sec`);
   } else {
-    console.log("pinecone retriever working");
-    const retriever = vectorStore.asRetriever({
-      search_type: "mmr",
-      search_kwargs: { k: 3 },
+    // Optimize vector search based on index type
+    if (indexType === "pinecone") {
+      console.log("pinecone retriever working");
+      const searchStartTime = Date.now();
+      
+      // Set up optimized query parameters
+      const searchOptions = { 
+        search_kwargs: { 
+          k: TOP_K,
+          include_metadata: true,
+          include_values: false // Don't need vectors back
+        }
+      };
+      
+      docs = await vectorStore.getRelevantDocuments(question, searchOptions);
+      
+      const searchTime = Date.now() - searchStartTime;
+      console.log(`PINECONE SEARCH TIME: ${(searchTime/1000).toFixed(2)} sec`);
+      console.log(`Retrieved ${docs.length} documents`);
+      
+    } else if (indexType === "milvus") {
+      console.log("milvus retriever working");
+      const searchStartTime = Date.now();
+      
+      // Use direct similarity search with optimized params
+      docs = await vectorStore.similaritySearch(question, TOP_K, {
+        includeValues: false, // Don't need vectors back
+        consistencyLevel: "Eventually" // Faster reads
+      });
+      
+      const searchTime = Date.now() - searchStartTime;
+      console.log(`MILVUS SEARCH TIME: ${(searchTime/1000).toFixed(2)} sec`);
+    }
+    
+    // Cache the results
+    vectorSearchCache.set(cacheKey, {
+      docs,
+      timestamp: Date.now()
     });
-    docs = await retriever.getRelevantDocuments(question);
+    
+    // Clean up old cache entries periodically
+    if (vectorSearchCache.size > 100) {
+      const now = Date.now();
+      for (const [key, value] of vectorSearchCache.entries()) {
+        if (now - value.timestamp > CACHE_TTL) {
+          vectorSearchCache.delete(key);
+        }
+      }
+    }
   }
 
-  timeFunction("After Retriever: ");
-  timeFunction("Chat Bot Starting Time: ");
+  // End timing for vector retrieval
+  const retrievalEndTime = Date.now();
+  const retrievalTime = retrievalEndTime - retrievalStartTime;
+  const retrievalSeconds = (retrievalTime / 1000).toFixed(2);
+  console.log(`VECTOR RETRIEVAL TIME: ${retrievalSeconds} sec (${indexType})`);
+
+  // Start timing for AI processing
+  const aiStartTime = Date.now();
+  
+  // Always limit chat_history to last 5 messages (if array)
+  let limitedHistory = Array.isArray(chatHistory)
+    ? chatHistory.slice(-5)
+    : chatHistory;
 
   let InpData = {
-    chat_history: chatHistory,
+    chat_history: limitedHistory,
     input:
       language === "English"
         ? question
         : JSON.stringify(question.trim().replace(/\s+/g, " ").normalize("NFC")),
-    context: docs,
+    context: docs, // do not truncate context
     language: language,
   };
 
@@ -73,12 +144,48 @@ async function* processChat(
     InpData.Eligibility_criteria = formData?.Eligibility_criteria;
     InpData.Restrictions = formData?.Restrictions;
   }
+  console.log("InpData", InpData);
 
-  const response = await chain.stream(InpData);
-    
+  // Start LLM processing timing
+  const llmStartTime = Date.now();
+  
+  // Stream with optimized parameters
+  const response = await chain.stream({
+    ...InpData,
+    stream: true,
+    timeout: 30000, // 30 second timeout
+  });
+  
+  // Track streaming stats
+  let chunkCount = 0;
+  let firstChunkTime = null;
+  
   for await (var chunk of response) {
+    chunkCount++;
+    if (chunkCount === 1) {
+      firstChunkTime = Date.now();
+      const timeToFirstChunk = firstChunkTime - llmStartTime;
+      console.log(`TIME TO FIRST CHUNK: ${(timeToFirstChunk/1000).toFixed(2)} sec`);
+    }
     yield chunk;
   }
+  
+  // End timing for AI processing
+  const aiEndTime = Date.now();
+  const aiTime = aiEndTime - aiStartTime;
+  const aiSeconds = (aiTime / 1000).toFixed(2);
+  console.log(`TOTAL LLM TIME: ${aiSeconds} sec (${chunkCount} chunks)`);
+  
+  if (firstChunkTime) {
+    const streamingTime = aiEndTime - firstChunkTime;
+    console.log(`STREAMING TIME: ${(streamingTime/1000).toFixed(2)} sec`);
+  }
+  
+  // End timing for the entire process
+  const totalEndTime = Date.now();
+  const totalTime = totalEndTime - totalStartTime;
+  const totalSeconds = (totalTime / 1000).toFixed(2);
+  console.log(`TOTAL PROCESS TIME: ${totalSeconds} sec`);
 }
 
 function parseConversationHistory(history) {
@@ -100,14 +207,20 @@ async function createChain(
     let modelInstance;
     if (model === "gpt") {
       modelInstance = new ChatOpenAI({
-        model: "gpt-4o",
-        temperature: 0.1,
+        model: "gpt-3.5-turbo", // Faster than GPT-4
+        temperature: 0.2,
+        max_tokens: 256,
+        presence_penalty: 0,
+        frequency_penalty: 0,
       });
     } else if (model == "azure") {
       console.log("Using Azure Model: .......");
       modelInstance = new AzureChatOpenAI({
-        temperature: 0,
-        maxRetries: 2,
+        temperature: 0.2,
+        maxRetries: 1, // Reduced retries for faster failure
+        max_tokens: 256,
+        presence_penalty: 0,
+        frequency_penalty: 0,
         azureOpenAIApiKey: process.env.AZURE_OPENAI_API_KEY_NAME,
       });
     }
